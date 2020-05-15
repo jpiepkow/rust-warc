@@ -130,20 +130,31 @@ pub struct WarcRecord {
 }
 
 impl WarcRecord {
-    pub fn parse(mut read: impl BufRead) -> Result<Self, WarcError> {
+    pub fn parse(mut read: impl BufRead, sum: &mut usize) -> Result<Self, WarcError> {
         let mut version = String::new();
-
-        if let Err(io) = read.read_line(&mut version) {
-            return Err(WarcError::IO(io));
-        }
+        let mut version_len = 0;
+        let mut headers_len = 0;
+        match read.read_line(&mut version) {
+            Err(io) => {
+                // println!("{:?}", 1);   
+                return Err(WarcError::IO(io))
+            },
+            Ok(pos) => {
+                *sum = *sum + pos;
+                version_len = pos;
+            }
+        };
 
         if version.is_empty() {
+           // println!("{:?}", 2);    
             return Err(WarcError::EOF);
         }
 
         rtrim(&mut version);
 
         if !version.starts_with("WARC/1.") {
+            *sum = *sum - version_len;
+            // println!("{:?}", 3);   
             return Err(WarcError::Malformed(String::from("Unknown WARC version")));
         }
 
@@ -152,9 +163,16 @@ impl WarcRecord {
         let mut continuation: Option<(CaseString, String)> = None;
         loop {
             let mut line_buf = String::new();
-
-            if let Err(io) = read.read_line(&mut line_buf) {
-                return Err(WarcError::IO(io));
+            match read.read_line(&mut line_buf) {
+                Err(io) => {
+                    *sum = *sum - version_len - headers_len;
+                    // println!("{:?}", 4);   
+                    return Err(WarcError::IO(io))
+                },
+                Ok(pos) => {
+                    *sum = *sum + pos;
+                    headers_len += pos;
+                }   
             }
 
             if &line_buf == "\r\n" {
@@ -168,6 +186,8 @@ impl WarcRecord {
                     keyval.1.push('\n');
                     keyval.1.push_str(line_buf.trim());
                 } else {
+                    *sum = *sum - version_len - headers_len;
+                    // println!("{:?}", 5);   
                     return Err(WarcError::Malformed(String::from("Invalid header block")));
                 }
             } else {
@@ -182,6 +202,8 @@ impl WarcRecord {
 
                     continuation = Some((line_buf.into(), value));
                 } else {
+                    *sum = *sum - version_len - headers_len;
+                    // println!("{:?}", 6);   
                     return Err(WarcError::Malformed(String::from("Invalid header field")));
                 }
             }
@@ -194,6 +216,8 @@ impl WarcRecord {
 
         let content_len = header.get(&"Content-Length".into());
         if content_len.is_none() {
+            *sum = *sum - version_len - headers_len;
+            // println!("{:?}", 7);   
             return Err(WarcError::Malformed(String::from(
                 "Content-Length is missing",
             )));
@@ -201,6 +225,8 @@ impl WarcRecord {
 
         let content_len = content_len.unwrap().parse::<usize>();
         if content_len.is_err() {
+            *sum = *sum - version_len - headers_len;
+            // println!("{:?}", 8);   
             return Err(WarcError::Malformed(String::from(
                 "Content-Length is not a number",
             )));
@@ -208,15 +234,28 @@ impl WarcRecord {
 
         let content_len = content_len.unwrap();
         let mut content = vec![0; content_len];
+        
         if let Err(io) = read.read_exact(&mut content) {
+
+            *sum = *sum - version_len - headers_len;
+            // println!("{:?}", 8);   
             return Err(WarcError::IO(io));
+        } else {
+            *sum = *sum + content_len;
         }
 
         let mut linefeed = [0u8; 4];
+        
         if let Err(io) = read.read_exact(&mut linefeed) {
+            *sum = *sum - version_len - headers_len - content_len;
+            // println!("{:?}", 9);   
             return Err(WarcError::IO(io));
+        } else {
+            *sum = *sum + 4;
         }
         if linefeed != [13, 10, 13, 10] {
+            *sum = *sum - version_len - headers_len - content_len;
+            // println!("{:?}", 10);   
             return Err(WarcError::Malformed(String::from(
                 "No double linefeed after record content",
             )));
@@ -258,7 +297,8 @@ pub enum WarcError {
 /// assert_eq!(warc.count(), 2);
 /// ```
 pub struct WarcReader<R> {
-    read: R,
+    pub read: R,
+    pub sum: usize,
     valid_state: bool,
 }
 
@@ -267,6 +307,7 @@ impl<R: BufRead> WarcReader<R> {
     pub fn new(read: R) -> Self {
         Self {
             read,
+            sum: 0,
             valid_state: true,
         }
     }
@@ -280,7 +321,7 @@ impl<R: BufRead> Iterator for WarcReader<R> {
             return None;
         }
 
-        match WarcRecord::parse(&mut self.read) {
+        match WarcRecord::parse(&mut self.read, &mut self.sum) {
             Ok(item) => Some(Ok(item)),
             Err(WarcError::EOF) => None,
             Err(e) => {
